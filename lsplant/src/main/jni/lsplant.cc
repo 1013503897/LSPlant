@@ -123,6 +123,8 @@ std::string generated_method_name;
 InitInfo::InlineHookFunType traceless_inline_hooker;
 // Optional force-compile callback (see InitInfo::force_compile). Empty = no nterp upgrade.
 std::function<void(void *, void *)> force_compile_cb;
+// Optional hooked-method notifier (see InitInfo::on_method_hooked). For the detection probe.
+std::function<void(void *)> on_method_hooked_cb;
 
 bool InitConfig(const InitInfo &info) {
     if (info.generated_class_name.empty()) {
@@ -143,6 +145,7 @@ bool InitConfig(const InitInfo &info) {
     generated_source_name = info.generated_source_name;
     traceless_inline_hooker = info.traceless_inline_hooker; // may be empty (normal path)
     force_compile_cb = info.force_compile;                   // may be empty
+    on_method_hooked_cb = info.on_method_hooked;             // may be empty
     return true;
 }
 
@@ -572,6 +575,7 @@ bool DoHook(ArtMethod *target, ArtMethod *hook, ArtMethod *backup) {
                      "trampoline %p; backup(%p) -> clone %p",
                      target, target->GetAccessFlags(), target->GetEntryPoint(), qc, entrypoint,
                      backup, clone_backup);
+                if (on_method_hooked_cb) on_method_hooked_cb(target);
                 return true;
             }
             LOGW("Traceless hook failed for %p (qc=%p); falling back to in-place entry swap", target,
@@ -588,6 +592,7 @@ bool DoHook(ArtMethod *target, ArtMethod *hook, ArtMethod *backup) {
              target->GetAccessFlags(), target->GetEntryPoint(), backup, backup->GetAccessFlags(),
              backup->GetEntryPoint(), hook, hook->GetAccessFlags(), hook->GetEntryPoint());
 
+        if (on_method_hooked_cb) on_method_hooked_cb(target);
         return true;
     }
 }

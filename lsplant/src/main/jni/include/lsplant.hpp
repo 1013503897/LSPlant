@@ -71,6 +71,11 @@ struct InitInfo {
     /// can't be compiled it stays on the shared stub and DoHook falls back to the in-place hook.
     std::function<void(void *method, void *thread)> force_compile;
 
+    /// \brief Optional notifier called after a Java method is hooked (any path). May be null.
+    /// \p method is the hooked target ArtMethod. Used by the detection probe to enumerate the
+    /// process's hooked methods and verify each one's ArtMethod is pristine (surface #3).
+    std::function<void(void *method)> on_method_hooked;
+
     /// \brief The generated class name. Must not be empty. It contains a field and a method
     /// and they could be set by \p generated_field_name and \p generated_method_name respectively.
     std::string_view generated_class_name = "LSPHooker_";
