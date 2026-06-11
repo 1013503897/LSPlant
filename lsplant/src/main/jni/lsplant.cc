@@ -121,6 +121,8 @@ std::string generated_method_name;
 // Optional KPM-only traceless hooker (see InitInfo::traceless_inline_hooker). Empty = the
 // normal in-place DoHook path. Set in InitConfig, used in DoHook.
 InitInfo::InlineHookFunType traceless_inline_hooker;
+// Optional force-compile callback (see InitInfo::force_compile). Empty = no nterp upgrade.
+std::function<void(void *, void *)> force_compile_cb;
 
 bool InitConfig(const InitInfo &info) {
     if (info.generated_class_name.empty()) {
@@ -140,6 +142,7 @@ bool InitConfig(const InitInfo &info) {
     generated_method_name = info.generated_method_name;
     generated_source_name = info.generated_source_name;
     traceless_inline_hooker = info.traceless_inline_hooker; // may be empty (normal path)
+    force_compile_cb = info.force_compile;                   // may be empty
     return true;
 }
 
@@ -531,6 +534,14 @@ void *GenerateTrampolineFor(art::ArtMethod *hook) {
 }
 
 bool DoHook(ArtMethod *target, ArtMethod *hook, ArtMethod *backup) {
+    // Traceless-path prep: if the target isn't individually compiled (runs via the shared
+    // nterp/interpreter stub), give it its OWN JIT body so the traceless trap has a unique
+    // region. MUST be before the suspend -- the JIT compiles on a background thread that can't
+    // run while all threads are suspended. Best-effort; if it stays on the stub, DoHook below
+    // just takes the in-place path. Only the KPM-traceless build sets force_compile_cb.
+    if (traceless_inline_hooker && force_compile_cb) {
+        force_compile_cb(target, art::Thread::Current());
+    }
     ScopedGCCriticalSection section(art::Thread::Current(), art::gc::kGcCauseDebugger,
                                     art::gc::kCollectorTypeDebugger);
     ScopedSuspendAll suspend("LSPlant Hook", false);

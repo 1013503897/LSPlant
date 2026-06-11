@@ -62,6 +62,15 @@ struct InitInfo {
     /// normal in-place entry-point swap.
     InlineHookFunType traceless_inline_hooker;
 
+    /// \brief Optional force-compile callback for the traceless path. May be null.
+    /// A method that isn't individually AOT-compiled runs via a SHARED nterp/interpreter stub
+    /// (no per-method code to trap traceless). When set, DoHook calls this BEFORE suspending all
+    /// threads (JIT compiles on a background thread that can't run under suspend-all) to give the
+    /// method its own JIT body, so the traceless trap has a unique compiled region. \p method is
+    /// the target ArtMethod, \p thread is the current art::Thread. Best-effort: if the method
+    /// can't be compiled it stays on the shared stub and DoHook falls back to the in-place hook.
+    std::function<void(void *method, void *thread)> force_compile;
+
     /// \brief The generated class name. Must not be empty. It contains a field and a method
     /// and they could be set by \p generated_field_name and \p generated_method_name respectively.
     std::string_view generated_class_name = "LSPHooker_";
