@@ -118,6 +118,10 @@ std::string generated_source_name;
 std::string generated_field_name;
 std::string generated_method_name;
 
+// Optional KPM-only traceless hooker (see InitInfo::traceless_inline_hooker). Empty = the
+// normal in-place DoHook path. Set in InitConfig, used in DoHook.
+InitInfo::InlineHookFunType traceless_inline_hooker;
+
 bool InitConfig(const InitInfo &info) {
     if (info.generated_class_name.empty()) {
         LOGE("generated class name cannot be empty");
@@ -135,6 +139,7 @@ bool InitConfig(const InitInfo &info) {
     }
     generated_method_name = info.generated_method_name;
     generated_source_name = info.generated_source_name;
+    traceless_inline_hooker = info.traceless_inline_hooker; // may be empty (normal path)
     return true;
 }
 
@@ -538,6 +543,29 @@ bool DoHook(ArtMethod *target, ArtMethod *hook, ArtMethod *backup) {
         // NOLINTNEXTLINE
     } else {
         LOGV("Generated trampoline %p", entrypoint);
+
+        // Traceless L2 path: if a KPM-only hooker is configured, trap the target method's
+        // compiled quick-entry CODE (a kernel UXN region clone) and reroute it to the
+        // trampoline, leaving the target ArtMethod 100% pristine (no entry_point swap, no
+        // flag flip) and its code bytes unmodified (CRC-clean). The backup runs the ORIGINAL
+        // via the in-clone copy returned by the hooker -- NOT the target's real entry, which
+        // is now trapped (calling it would re-fault into the trampoline -> infinite recursion).
+        if (traceless_inline_hooker) {
+            void *qc = target->GetEntryPoint();
+            if (void *clone_backup = traceless_inline_hooker(qc, entrypoint)) {
+                backup->CopyFrom(target);
+                backup->SetEntryPoint(clone_backup);
+                backup->SetNonCompilable();
+                if (!backup->IsStatic()) backup->SetPrivate();
+                LOGV("Traceless hook: target(%p:0x%x) entry=%p kept PRISTINE; qc=%p trapped -> "
+                     "trampoline %p; backup(%p) -> clone %p",
+                     target, target->GetAccessFlags(), target->GetEntryPoint(), qc, entrypoint,
+                     backup, clone_backup);
+                return true;
+            }
+            LOGW("Traceless hook failed for %p (qc=%p); falling back to in-place entry swap", target,
+                 target->GetEntryPoint());
+        }
 
         target->BackupTo(backup);
 

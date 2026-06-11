@@ -50,6 +50,18 @@ struct InitInfo {
     /// \brief The symbol prefix resolver to \p libart.so. May be null.
     ArtSymbolPrefixResolver art_symbol_prefix_resolver;
 
+    /// \brief Optional KPM-only *traceless* inline hooker (no Dobby fallback). May be null.
+    /// When set, DoHook traps the target Java method's compiled quick-entry CODE via this
+    /// (a kernel UXN region clone) and reroutes it to the trampoline, instead of overwriting
+    /// the ArtMethod's entry_point / access_flags. The ArtMethod is then left byte-pristine
+    /// (defeating pointer-roaming + flag detection) and the target's code bytes are unmodified
+    /// (CRC-clean). \p target is the method's quick-compiled code address, \p hooker is the
+    /// trampoline. \p return is the in-clone faithful copy of the original (used as the
+    /// call-original backup -- it must NOT be the original code addr, which is now trapped).
+    /// Returns null if the method cannot be trapped, in which case DoHook falls back to the
+    /// normal in-place entry-point swap.
+    InlineHookFunType traceless_inline_hooker;
+
     /// \brief The generated class name. Must not be empty. It contains a field and a method
     /// and they could be set by \p generated_field_name and \p generated_method_name respectively.
     std::string_view generated_class_name = "LSPHooker_";
