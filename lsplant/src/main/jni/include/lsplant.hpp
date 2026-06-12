@@ -161,6 +161,16 @@ struct InitInfo {
 /// \see Hook()
 [[nodiscard, maybe_unused, gnu::visibility("default")]] bool IsHooked(JNIEnv *env, jobject method);
 
+/// \brief M-C: convert an already-installed in-place hook into a TRACELESS one (entry stays the
+/// method's real JIT code, the KPM traps it + reroutes to the trampoline). Call POST-INIT (JIT
+/// thread up) from a normal thread. \p art_method is the hooked target ArtMethod*. Requires the
+/// InitInfo force_compile + traceless_inline_hooker callbacks. Returns true on success.
+[[maybe_unused, gnu::visibility("default")]] bool ConvertToTraceless(void *art_method);
+
+/// \brief Whether the live art::jit::Jit instance has been captured (needed by ConvertToTraceless
+/// to force-compile). Captured the first time ART JITs any method. False until then.
+[[maybe_unused, gnu::visibility("default")]] bool HasCapturedJit();
+
 /// \brief Deoptimize a method to avoid hooked callee not being called because of inline
 /// \param[in] env The Java environment.
 /// \param[in] method The method to deoptimize. By deoptimizing the method, the method will back all

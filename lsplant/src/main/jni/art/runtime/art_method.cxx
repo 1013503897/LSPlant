@@ -55,6 +55,14 @@ public:
         SetAccessFlags(access_flags);
     }
 
+    // Undo SetNonCompilable so ART will JIT-compile this method again (used by the traceless
+    // conversion: clear the hook's don't-compile mark before force-compiling).
+    void SetCompilable() {
+        auto access_flags = GetAccessFlags();
+        access_flags &= ~kAccCompileDontBother;
+        SetAccessFlags(access_flags);
+    }
+
     void ClearFastInterpretFlag() {
         auto access_flags = GetAccessFlags();
         access_flags &= ~kAccFastInterpreterToInterpreterInvoke;

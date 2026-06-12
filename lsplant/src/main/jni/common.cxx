@@ -165,6 +165,17 @@ inline void RecordHooked(art::ArtMethod * target, const art::dex::ClassDef *clas
                             std::make_pair(backup, std::make_pair(nullptr, target))});
 }
 
+// Stop tracking `target` as hooked: ART will then JIT-compile it and LSPlant's instrumentation
+// hooks will no longer re-pin entry==trampoline (the traceless conversion relies on this so the
+// method's entry can become real JIT code). Erases both target->backup and backup->target.
+inline void UnrecordHooked(art::ArtMethod * target) {
+    art::ArtMethod *backup = nullptr;
+    hooked_methods_.if_contains(target, [&backup](const auto &it) { backup = it.second.second; });
+    hooked_methods_.erase(target);
+    if (backup) hooked_methods_.erase(backup);
+    deoptimized_methods_set_.erase(target);
+}
+
 inline void RecordDeoptimized(const art::dex::ClassDef *class_def, art::ArtMethod *art_method) {
     { deoptimized_classes_[class_def].emplace(art_method); }
     deoptimized_methods_set_.insert(art_method);

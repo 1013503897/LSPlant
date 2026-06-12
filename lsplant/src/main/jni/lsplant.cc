@@ -7,6 +7,7 @@ module;
 #include <jni.h>
 #include <sys/mman.h>
 #include <sys/system_properties.h>
+#include <unistd.h>
 
 #include <array>
 #include <atomic>
@@ -537,14 +538,9 @@ void *GenerateTrampolineFor(art::ArtMethod *hook) {
 }
 
 bool DoHook(ArtMethod *target, ArtMethod *hook, ArtMethod *backup) {
-    // Traceless-path prep: if the target isn't individually compiled (runs via the shared
-    // nterp/interpreter stub), give it its OWN JIT body so the traceless trap has a unique
-    // region. MUST be before the suspend -- the JIT compiles on a background thread that can't
-    // run while all threads are suspended. Best-effort; if it stays on the stub, DoHook below
-    // just takes the in-place path. Only the KPM-traceless build sets force_compile_cb.
-    if (traceless_inline_hooker && force_compile_cb) {
-        force_compile_cb(target, art::Thread::Current());
-    }
+    // NOTE: nterp/interpreted targets can't be force-compiled here (DoHook runs during early app
+    // init before the JIT thread is up, and a compile-wait would block startup). They take the
+    // in-place path below and the post-init ConvertHookToTraceless worker upgrades them later.
     ScopedGCCriticalSection section(art::Thread::Current(), art::gc::kGcCauseDebugger,
                                     art::gc::kCollectorTypeDebugger);
     ScopedSuspendAll suspend("LSPlant Hook", false);
@@ -609,6 +605,71 @@ bool DoUnHook(ArtMethod *target, ArtMethod *backup) {
          target->GetAccessFlags(), target->GetEntryPoint(), backup, backup->GetAccessFlags(),
          backup->GetEntryPoint());
     return true;
+}
+
+// M-C: convert an already-installed in-place hook on `target` into a TRACELESS one. Run post-init
+// (the JIT compiler thread must be up) from a NORMAL thread -- this creates its own brief suspends;
+// the force-compile happens BETWEEN them, un-suspended, so the JIT thread can run. Returns true on
+// success; on failure restores the working in-place hook. After success: target.entry == its own
+// JIT code (pristine), access_flags clean, and the KPM traps that code + reroutes to the live
+// trampoline; call-original runs via the in-clone copy.
+bool ConvertHookToTraceless(ArtMethod *target) {
+    if (!traceless_inline_hooker) return false;
+    auto *backup = IsHooked(target);
+    if (!backup) return false;  // not hooked (or already converted)
+    void *trampoline = target->GetEntryPoint();  // current entry == the LSPlant trampoline
+    LOGI("Traceless convert: target=%p trampoline=%p captured_jit=%d", target, trampoline,
+         (int)Jit::HasCapturedJit());
+
+    // 1. stop LSPlant pinning the hook + make compilable, so when ART JIT-compiles `target` its
+    //    instrumentation will set entry=JIT and not be re-pinned to the trampoline. We KEEP
+    //    entry==trampoline meanwhile, so the hook still fires while the compile is in flight (no
+    //    un-hook window for the critical framework methods).
+    {
+        ScopedGCCriticalSection section(art::Thread::Current(), art::gc::kGcCauseDebugger,
+                                        art::gc::kCollectorTypeDebugger);
+        ScopedSuspendAll suspend("LSPlant traceless convert", false);
+        UnrecordHooked(target);
+        target->SetCompilable();
+    }
+
+    // 2. force the JIT to give `target` a real body (un-suspended -> the JIT thread runs) and poll
+    //    until its entry moves off the trampoline (== ART installed JIT code) or a ~1.5s timeout.
+    if (!Jit::ForceOptimizedCompile(target, art::Thread::Current())) {
+        LOGW("Traceless convert: no captured Jit yet for %p; kept in-place", target);
+        return false;  // entry is still the trampoline -> hook still works
+    }
+    for (int i = 0; i < 300; i++) {
+        if (target->GetEntryPoint() != trampoline) break;
+        usleep(5000);
+    }
+    void *qc = target->GetEntryPoint();
+    if (qc == trampoline) {
+        LOGW("Traceless convert: %p did not compile in time; kept in-place", target);
+        return false;  // entry still trampoline -> hook still works
+    }
+
+    // 3. trap the now-compiled JIT body traceless, rerouting its entry to the still-live trampoline.
+    bool ok = false;
+    {
+        ScopedGCCriticalSection section(art::Thread::Current(), art::gc::kGcCauseDebugger,
+                                        art::gc::kCollectorTypeDebugger);
+        ScopedSuspendAll suspend("LSPlant traceless convert", false);
+        if (void *clone = traceless_inline_hooker(qc, trampoline)) {
+            backup->CopyFrom(target);      // backup mirrors the now-pristine target...
+            backup->SetEntryPoint(clone);  // ...but call-original runs via the in-clone copy
+            backup->SetNonCompilable();
+            if (!backup->IsStatic()) backup->SetPrivate();
+            ok = true;
+            LOGI("Traceless convert OK: target(%p:0x%x) entry=%p; qc=%p trapped -> trampoline %p",
+                 target, target->GetAccessFlags(), target->GetEntryPoint(), qc, trampoline);
+        } else {
+            target->SetEntryPoint(trampoline);  // restore the working in-place hook
+            target->SetNonCompilable();
+            LOGW("Traceless convert: trap failed for %p (qc=%p); kept in-place", target, qc);
+        }
+    }
+    return ok;
 }
 
 std::string GetProxyMethodShorty(JNIEnv *env, jobject proxy_method) {
@@ -824,6 +885,13 @@ using ::lsplant::IsHooked;
     auto *art_method = ArtMethod::FromReflectedMethod(env, method);
     return IsHooked(art_method);
 }
+
+[[maybe_unused]] bool ConvertToTraceless(void *art_method) {
+    if (!art_method) return false;
+    return ConvertHookToTraceless(reinterpret_cast<ArtMethod *>(art_method));
+}
+
+[[maybe_unused]] bool HasCapturedJit() { return Jit::HasCapturedJit(); }
 
 [[maybe_unused]] bool Deoptimize(JNIEnv *env, jobject method) {
     if (!method || !JNI_IsInstanceOf(env, method, executable)) {
