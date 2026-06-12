@@ -65,6 +65,18 @@ export class Jit {
             return backup(thiz, method, self, compilation_kind, osr);
         };
 
+    // Hotness-check sink: ART calls Jit::MaybeEnqueueCompilation on every hotness-threshold tick to
+    // DECIDE whether to compile -- so it fires even in a QUIET process that never actually compiles
+    // anything (CompileMethod/Enqueue* above only fire on a real compile). This is what lets the M-C
+    // convert worker capture the live Jit in katana's aux processes / trivial apps that don't JIT.
+    inline static auto MaybeEnqueueCompilation_ =
+        "_ZN3art3jit3Jit23MaybeEnqueueCompilationEPNS_9ArtMethodEPNS_6ThreadE"_sym.hook->*[]
+        <MemBackup auto backup>
+        (Jit *thiz, ArtMethod *method, Thread *self) static -> void {
+            captured_ = thiz;
+            return backup(thiz, method, self);
+        };
+
 public:
     // Force `method` onto the JIT optimized-compile queue (best effort). Needs the captured Jit
     // instance (some method must have been JIT'd naturally first). Returns false if not yet captured.
@@ -83,6 +95,7 @@ public:
         handler(EnqueueOptimizedCompilation_);
         handler(AddCompileTask_);
         handler(CompileMethod_);  // universal capture point for the live Jit instance
+        handler(MaybeEnqueueCompilation_);  // hotness-check sink -> captures even in QUIET processes
         handler(EnqueueOptimizedCompilationCall_);  // resolve the direct-call alias
         LOGI("jit capture hooks registered (sdk=%d)", GetAndroidApiLevel());
         return true;
