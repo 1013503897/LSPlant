@@ -33,6 +33,8 @@ export class JitCodeCache {
         (JitCodeCache *thiz, Thread *self) static -> void {
             MoveObsoleteMethods(thiz);
             backup(thiz, self);
+            // follow traceless traps across this collection (no-op on non-traceless builds)
+            if (lsplant::on_jit_gc_revalidate_) lsplant::on_jit_gc_revalidate_();
         };
 
     inline static auto DoCollection_ =
@@ -41,6 +43,8 @@ export class JitCodeCache {
         (JitCodeCache *thiz, Thread *self) static -> void {
             MoveObsoleteMethods(thiz);
             backup(thiz, self);
+            // follow traceless traps across this collection (no-op on non-traceless builds)
+            if (lsplant::on_jit_gc_revalidate_) lsplant::on_jit_gc_revalidate_();
         };
 
 public:

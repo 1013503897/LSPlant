@@ -4,6 +4,7 @@ module;
 #include <parallel_hashmap/phmap.h>
 #include <sys/system_properties.h>
 
+#include <functional>
 #include <list>
 #include <shared_mutex>
 #include <string_view>
@@ -185,4 +186,55 @@ inline void RecordJitMovement(art::ArtMethod * target, art::ArtMethod * backup) 
     std::unique_lock lk(jit_movements_lock_);
     jit_movements_.emplace_back(target, backup);
 }
+
+// --- Traceless (SSOL) trap registry: JIT-move-follow (M-B) -----------------------------------
+// A traceless hook traps the target method's compiled quick-entry CODE page. ART's JIT cache GC
+// can later FREE or RECOMPILE that body, moving the target's entry to a different page. The old
+// page is then recycled by ART for unrelated code while our KPM trap + static instruction
+// snapshot still point at it -> the snapshot mis-simulates the recycled code -> SIGILL. To follow
+// the move we remember every live traceless trap and, right after each JIT GC, re-read each
+// target's current entry; if it moved we disarm the stale trap and (if the new entry is still a
+// trappable body) re-arm at the new page. `target`/`backup` are ArtMethod* (incomplete here --
+// the ArtMethod work is done in lsplant.cc, which has the complete type). `qc` is the currently
+// trapped code address; `trampoline` is the hook entry to re-route to on re-arm.
+struct TracelessTrap {
+    art::ArtMethod *target;
+    void *qc;
+    void *trampoline;
+    art::ArtMethod *backup;
+};
+std::list<TracelessTrap> traceless_traps_;
+std::shared_mutex traceless_traps_lock_;
+
+// Record (or update, on re-hook of the same target) a live traceless trap.
+inline void RecordTracelessTrap(art::ArtMethod * target, void *qc, void *trampoline,
+                                art::ArtMethod *backup) {
+    std::unique_lock lk(traceless_traps_lock_);
+    for (auto &t : traceless_traps_)
+        if (t.target == target) {
+            t.qc = qc;
+            t.trampoline = trampoline;
+            t.backup = backup;
+            return;
+        }
+    traceless_traps_.emplace_back(TracelessTrap{target, qc, trampoline, backup});
+}
+
+// Drop a traceless trap from the registry (on real unhook) so revalidation never touches a freed
+// backup. Returns the trapped qc (0 if not tracked) so the caller can disarm the KPM trap.
+inline void *ForgetTracelessTrap(art::ArtMethod * target) {
+    std::unique_lock lk(traceless_traps_lock_);
+    for (auto it = traceless_traps_.begin(); it != traceless_traps_.end(); ++it)
+        if (it->target == target) {
+            void *qc = it->qc;
+            traceless_traps_.erase(it);
+            return qc;
+        }
+    return nullptr;
+}
+
+// Set by Init (lsplant.cc) when the traceless backend is configured; invoked by the JIT-GC hook
+// (jit_code_cache.cxx) AFTER the collection runs. Empty on normal (non-traceless) builds, where
+// it is never called -> zero behavior change.
+std::function<void()> on_jit_gc_revalidate_;
 }  // namespace lsplant

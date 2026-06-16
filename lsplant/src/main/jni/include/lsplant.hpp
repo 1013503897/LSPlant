@@ -62,6 +62,13 @@ struct InitInfo {
     /// normal in-place entry-point swap.
     InlineHookFunType traceless_inline_hooker;
 
+    /// \brief Optional traceless un-hooker, paired with \ref traceless_inline_hooker. May be null.
+    /// Disarms the KPM trap on a previously traceless-trapped quick-compiled code address. Used to
+    /// follow JIT cache moves: when a JIT GC relocates/evicts a traceless-hooked method, the stale
+    /// trap on its old (now-recycled) code page is disarmed via this before re-arming at the new
+    /// entry. \p func is the trapped quick-compiled code address. \p return indicates success.
+    InlineUnhookFunType traceless_inline_unhooker;
+
     /// \brief Optional force-compile callback for the traceless path. May be null.
     /// A method that isn't individually AOT-compiled runs via a SHARED nterp/interpreter stub
     /// (no per-method code to trap traceless). When set, DoHook calls this BEFORE suspending all

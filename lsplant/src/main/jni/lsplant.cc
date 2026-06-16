@@ -12,6 +12,9 @@ module;
 #include <array>
 #include <atomic>
 #include <bit>
+#include <list>
+#include <mutex>
+#include <shared_mutex>
 #include <string_view>
 #include <tuple>
 
@@ -122,10 +125,60 @@ std::string generated_method_name;
 // Optional KPM-only traceless hooker (see InitInfo::traceless_inline_hooker). Empty = the
 // normal in-place DoHook path. Set in InitConfig, used in DoHook.
 InitInfo::InlineHookFunType traceless_inline_hooker;
+// Optional traceless un-hooker (see InitInfo::traceless_inline_unhooker). Disarms a KPM trap by
+// its quick-compiled code address; used to follow JIT-cache moves. May be empty.
+InitInfo::InlineUnhookFunType traceless_inline_unhooker;
 // Optional force-compile callback (see InitInfo::force_compile). Empty = no nterp upgrade.
 std::function<void(void *, void *)> force_compile_cb;
 // Optional hooked-method notifier (see InitInfo::on_method_hooked). For the detection probe.
 std::function<void(void *)> on_method_hooked_cb;
+
+// JIT-move-follow (M-B): after every JIT cache GC, re-validate each live traceless trap. ART may
+// have freed or recompiled a trapped method's body, moving its entry to a new page; the old page
+// is then recycled for unrelated code while our trap + static snapshot still point at it -> the
+// snapshot mis-simulates -> SIGILL. For each trap whose target entry moved off the trapped qc:
+// disarm the stale trap FIRST (safety -- stops the recycled page from being mis-driven), then try
+// to re-arm at the new entry (stays traceless). If the new entry is no longer a trappable body
+// (evicted to interpreter/nterp), the trap is dropped: the method then runs un-hooked but correct
+// (no crash, ArtMethod still pristine). Runs on the ART JIT thread post-collection (mutators are
+// resumed); the per-target entry read/write is a single aligned word (atomic on arm64).
+void RevalidateTracelessTraps() {
+    if (!traceless_inline_hooker) return;
+    // Snapshot the registry under the lock (a pure-C++ copy: no syscall, no ART safepoint poll, so
+    // this thread cannot be suspended mid-copy), then do the KPM bridge work WITHOUT the lock held.
+    // Holding traceless_traps_lock_ across a bridge syscall would risk a deadlock: a concurrent
+    // DoHook runs under ScopedSuspendAll and could suspend this (JIT GC) thread, then block on the
+    // same lock in RecordTracelessTrap. Updates are applied back under a brief re-lock, keyed by
+    // target (tolerant of a concurrent unhook having removed the entry meanwhile).
+    std::list<TracelessTrap> snap;
+    {
+        std::unique_lock lk(traceless_traps_lock_);
+        snap = traceless_traps_;
+    }
+    for (auto &t : snap) {
+        void *cur = t.target->GetEntryPoint();
+        if (cur == t.qc) continue;  // unchanged -> trap still valid
+        // moved/evicted: disarm the stale trap on the old (now-recyclable) page first
+        if (traceless_inline_unhooker) traceless_inline_unhooker(t.qc);
+        // try to follow the move: re-arm at the new body (the hooker returns null if `cur` is not
+        // a trappable JIT/AOT body, e.g. evicted to a shared interpreter/nterp stub)
+        void *new_bk = traceless_inline_hooker(cur, t.trampoline);
+        if (new_bk) {
+            t.backup->SetEntryPoint(new_bk);  // call-original follows the move
+            LOGV("Traceless trap followed JIT move: target=%p qc -> %p, backup -> %p", t.target, cur,
+                 new_bk);
+        } else {
+            LOGW("Traceless trap dropped (target=%p evicted to untrappable entry %p)", t.target, cur);
+        }
+        std::unique_lock lk(traceless_traps_lock_);
+        for (auto it = traceless_traps_.begin(); it != traceless_traps_.end(); ++it) {
+            if (it->target != t.target) continue;
+            if (new_bk) it->qc = cur;            // followed -> track new page
+            else traceless_traps_.erase(it);     // evicted -> stop tracking
+            break;
+        }
+    }
+}
 
 bool InitConfig(const InitInfo &info) {
     if (info.generated_class_name.empty()) {
@@ -145,8 +198,12 @@ bool InitConfig(const InitInfo &info) {
     generated_method_name = info.generated_method_name;
     generated_source_name = info.generated_source_name;
     traceless_inline_hooker = info.traceless_inline_hooker; // may be empty (normal path)
+    traceless_inline_unhooker = info.traceless_inline_unhooker; // may be empty
     force_compile_cb = info.force_compile;                   // may be empty
     on_method_hooked_cb = info.on_method_hooked;             // may be empty
+    // arm the JIT-GC revalidation hook only when the traceless backend is configured; on normal
+    // builds this stays empty and the JIT-GC hook never calls it (zero behavior change)
+    if (traceless_inline_hooker) on_jit_gc_revalidate_ = [] { RevalidateTracelessTraps(); };
     return true;
 }
 
@@ -571,6 +628,7 @@ bool DoHook(ArtMethod *target, ArtMethod *hook, ArtMethod *backup) {
                      "trampoline %p; backup(%p) -> clone %p",
                      target, target->GetAccessFlags(), target->GetEntryPoint(), qc, entrypoint,
                      backup, clone_backup);
+                RecordTracelessTrap(target, qc, entrypoint, backup);  // follow JIT moves
                 if (on_method_hooked_cb) on_method_hooked_cb(target);
                 return true;
             }
@@ -594,6 +652,11 @@ bool DoHook(ArtMethod *target, ArtMethod *hook, ArtMethod *backup) {
 }
 
 bool DoUnHook(ArtMethod *target, ArtMethod *backup) {
+    // if this target was traceless-trapped, drop it from the JIT-move registry (so revalidation
+    // never touches the about-to-be-stale backup) and disarm its KPM trap
+    if (void *qc = ForgetTracelessTrap(target)) {
+        if (traceless_inline_unhooker) traceless_inline_unhooker(qc);
+    }
     ScopedGCCriticalSection section(art::Thread::Current(), art::gc::kGcCauseDebugger,
                                     art::gc::kCollectorTypeDebugger);
     ScopedSuspendAll suspend("LSPlant Hook", false);
@@ -660,6 +723,7 @@ bool ConvertHookToTraceless(ArtMethod *target) {
             backup->SetEntryPoint(clone);  // ...but call-original runs via the in-clone copy
             backup->SetNonCompilable();
             if (!backup->IsStatic()) backup->SetPrivate();
+            RecordTracelessTrap(target, qc, trampoline, backup);  // follow JIT moves
             ok = true;
             LOGI("Traceless convert OK: target(%p:0x%x) entry=%p; qc=%p trapped -> trampoline %p",
                  target, target->GetAccessFlags(), target->GetEntryPoint(), qc, trampoline);
